@@ -6,6 +6,279 @@
 <title>Controle Financeiro</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script type="module">
+// ── Firebase Setup ─────────────────────────────────────────────────────
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCShbbJudp_Iro1rNQkAlRp74mkKAOyhHA",
+  authDomain: "controle-financeiro-b4135.firebaseapp.com",
+  projectId: "controle-financeiro-b4135",
+  storageBucket: "controle-financeiro-b4135.firebasestorage.app",
+  messagingSenderId: "118021972019",
+  appId: "1:118021972019:web:c967c6f46d56273dfac346"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// ── Account Management ─────────────────────────────────────────────────
+let currentAccountId = null;
+
+function getAccountsRef() { return doc(db, "financas", "_contas"); }
+function getAccountDataRef(id) { return doc(db, "financas", "conta_" + id); }
+
+window.firebaseSave = async function(data) {
+  if (!currentAccountId) return;
+  try { await setDoc(getAccountDataRef(currentAccountId), data); }
+  catch(e) { console.error("Erro ao salvar:", e); }
+};
+
+// Load account list from Firebase
+async function loadAccounts() {
+  try {
+    const snap = await getDoc(getAccountsRef());
+    return snap.exists() ? (snap.data().list || []) : [];
+  } catch(e) { return []; }
+}
+
+async function saveAccounts(list) {
+  try { await setDoc(getAccountsRef(), { list }); }
+  catch(e) { console.error("Erro ao salvar contas:", e); }
+}
+
+// Load data for a specific account
+async function loadAccountData(accountId) {
+  try {
+    const snap = await getDoc(getAccountDataRef(accountId));
+    if (snap.exists()) {
+      const data = snap.data();
+      localStorage.setItem('fin_tx', data.fin_tx || '[]');
+      localStorage.setItem('fin_limits', data.fin_limits || '{}');
+      localStorage.setItem('fin_inst', data.fin_inst || '[]');
+      localStorage.setItem('fin_inc', data.fin_inc || '[]');
+      localStorage.setItem('fin_rec', data.fin_rec || '[]');
+      localStorage.setItem('fin_meta', data.fin_meta || '0');
+      if (data.notas) Object.entries(data.notas).forEach(([k,v]) => localStorage.setItem(k, v));
+    } else {
+      // New account — clear localStorage
+      ['fin_tx','fin_limits','fin_inst','fin_inc','fin_rec','fin_meta'].forEach(k => localStorage.removeItem(k));
+    }
+  } catch(e) { console.error("Erro ao carregar conta:", e); }
+}
+
+// ── Account Selection Screen ───────────────────────────────────────────
+function renderAccountScreen(accounts, errorMsg) {
+  const colors = ['#c8f060','#60d4f0','#f06090','#a060f0','#f0a060'];
+  document.getElementById('loading-screen').innerHTML = `
+    <div style="width:100%;max-width:480px;padding:24px">
+      <div style="text-align:center;margin-bottom:40px">
+        <div style="font-family:'DM Serif Display',serif;font-size:36px;color:#f0ede8;line-height:1">
+          Controle <span style="color:#c8f060;font-style:italic">Financeiro</span>
+        </div>
+        <div style="font-size:11px;color:#4a4754;letter-spacing:.1em;margin-top:8px;text-transform:uppercase">Selecione uma conta</div>
+      </div>
+
+      <div id="accountList" style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px">
+        ${accounts.map((acc,i) => `
+          <div onclick="window.selectAccount('${acc.id}')" style="
+            background:#19181d;border:1px solid #2e2c35;padding:18px 20px;
+            cursor:pointer;display:flex;align-items:center;gap:14px;
+            transition:border-color .2s;border-left:3px solid ${colors[i%colors.length]}
+          " onmouseover="this.style.borderColor='${colors[i%colors.length]}'" onmouseout="this.style.borderColor='#2e2c35';this.style.borderLeftColor='${colors[i%colors.length]}'">
+            <div style="width:38px;height:38px;border-radius:50%;background:${colors[i%colors.length]}22;border:1px solid ${colors[i%colors.length]}44;display:flex;align-items:center;justify-content:center;font-family:'DM Serif Display',serif;font-size:18px;color:${colors[i%colors.length]};flex-shrink:0">
+              ${acc.name.charAt(0).toUpperCase()}
+            </div>
+            <div style="flex:1">
+              <div style="font-size:14px;color:#f0ede8">${acc.name}</div>
+              <div style="font-size:10px;color:#4a4754;margin-top:2px;letter-spacing:.06em">🔒 protegida por PIN</div>
+            </div>
+            <div style="color:#4a4754;font-size:18px">›</div>
+          </div>
+        `).join('')}
+      </div>
+
+      ${errorMsg ? `<div style="background:#f0606022;border:1px solid #f0606044;color:#f06060;padding:10px 14px;font-size:11px;letter-spacing:.06em;margin-bottom:16px;text-align:center">${errorMsg}</div>` : ''}
+
+      <button onclick="window.showNewAccountForm()" style="
+        width:100%;background:none;border:1px dashed #2e2c35;color:#8a8694;
+        padding:14px;font-family:'DM Mono',monospace;font-size:11px;
+        letter-spacing:.1em;text-transform:uppercase;cursor:pointer;
+        transition:all .2s
+      " onmouseover="this.style.borderColor='#c8f060';this.style.color='#c8f060'" onmouseout="this.style.borderColor='#2e2c35';this.style.color='#8a8694'">
+        ＋ Nova Conta
+      </button>
+    </div>
+
+    <!-- PIN Modal -->
+    <div id="pinModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);align-items:center;justify-content:center;z-index:100">
+      <div style="background:#19181d;border:1px solid #2e2c35;padding:32px;min-width:300px;text-align:center">
+        <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:6px" id="pinTitle">Digite o PIN</div>
+        <div style="font-size:11px;color:#4a4754;margin-bottom:24px;letter-spacing:.06em" id="pinSubtitle">4 dígitos</div>
+        <div id="pinDots" style="display:flex;justify-content:center;gap:12px;margin-bottom:28px">
+          ${[0,1,2,3].map(i=>`<div id="pd${i}" style="width:14px;height:14px;border-radius:50%;background:#2e2c35;transition:background .15s"></div>`).join('')}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:220px;margin:0 auto">
+          ${[1,2,3,4,5,6,7,8,9,'',0,'←'].map(k=>`
+            <button onclick="window.pinKey('${k}')" style="
+              background:#0f0e11;border:1px solid #2e2c35;color:${k===''?'transparent':'#f0ede8'};
+              font-family:'DM Mono',monospace;font-size:18px;padding:14px;cursor:${k===''?'default':'pointer'};
+              transition:all .15s;pointer-events:${k===''?'none':'auto'}
+            " ${k!==''?`onmouseover="this.style.borderColor='#c8f060'" onmouseout="this.style.borderColor='#2e2c35'"`:''}>${k}</button>
+          `).join('')}
+        </div>
+        <button onclick="window.closePinModal()" style="margin-top:20px;background:none;border:none;color:#4a4754;font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;letter-spacing:.08em">Cancelar</button>
+      </div>
+    </div>
+
+    <!-- New Account Modal -->
+    <div id="newAccModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);align-items:center;justify-content:center;z-index:100">
+      <div style="background:#19181d;border:1px solid #2e2c35;padding:32px;min-width:320px">
+        <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:20px">Nova Conta</div>
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8a8694;margin-bottom:6px">Nome da conta</div>
+          <input id="newAccName" type="text" placeholder="Ex: Márcio" maxlength="20" style="width:100%;background:#0f0e11;border:1px solid #2e2c35;color:#f0ede8;padding:10px 12px;font-family:'DM Mono',monospace;font-size:13px;outline:none">
+        </div>
+        <div style="margin-bottom:20px">
+          <div style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8a8694;margin-bottom:6px">PIN (4 dígitos)</div>
+          <input id="newAccPin" type="password" inputmode="numeric" placeholder="••••" maxlength="4" style="width:100%;background:#0f0e11;border:1px solid #2e2c35;color:#f0ede8;padding:10px 12px;font-family:'DM Mono',monospace;font-size:20px;outline:none;letter-spacing:.3em;text-align:center">
+        </div>
+        <div id="newAccError" style="display:none;background:#f0606022;border:1px solid #f0606044;color:#f06060;padding:8px 12px;font-size:11px;margin-bottom:14px;text-align:center"></div>
+        <div style="display:flex;gap:8px">
+          <button onclick="window.closeNewAccModal()" style="flex:1;background:none;border:1px solid #2e2c35;color:#8a8694;padding:10px;font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">Cancelar</button>
+          <button onclick="window.createAccount()" style="flex:1;background:#c8f060;color:#0f0e11;border:none;padding:10px;font-family:'DM Mono',monospace;font-size:11px;font-weight:500;cursor:pointer;letter-spacing:.08em">✓ Criar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// PIN logic
+let pinBuffer = '';
+let pinTargetAccount = null;
+let pinMode = 'login'; // 'login'
+
+window.selectAccount = function(id) {
+  const accounts = window._accounts || [];
+  const acc = accounts.find(a => a.id === id);
+  if (!acc) return;
+  pinTargetAccount = acc;
+  pinBuffer = '';
+  updatePinDots();
+  document.getElementById('pinTitle').textContent = acc.name;
+  document.getElementById('pinSubtitle').textContent = 'Digite o PIN de acesso';
+  document.getElementById('pinModal').style.display = 'flex';
+};
+
+window.pinKey = function(k) {
+  if (k === '←') { pinBuffer = pinBuffer.slice(0,-1); updatePinDots(); return; }
+  if (k === '' || pinBuffer.length >= 4) return;
+  pinBuffer += k;
+  updatePinDots();
+  if (pinBuffer.length === 4) setTimeout(validatePin, 150);
+};
+
+function updatePinDots() {
+  for (let i=0;i<4;i++) {
+    const d = document.getElementById('pd'+i);
+    if (d) d.style.background = i < pinBuffer.length ? '#c8f060' : '#2e2c35';
+  }
+}
+
+async function validatePin() {
+  if (!pinTargetAccount) return;
+  if (pinBuffer === pinTargetAccount.pin) {
+    document.getElementById('pinModal').style.display = 'none';
+    currentAccountId = pinTargetAccount.id;
+    document.getElementById('loading-screen').innerHTML = `
+      <div style="font-family:'DM Serif Display',serif;font-size:36px;color:#f0ede8">Controle <span style="color:#c8f060;font-style:italic">Financeiro</span></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:20px">
+        <div style="width:7px;height:7px;border-radius:50%;background:#c8f060;animation:pulse 1.2s ease-in-out infinite"></div>
+        <div style="width:7px;height:7px;border-radius:50%;background:#c8f060;animation:pulse 1.2s ease-in-out .2s infinite"></div>
+        <div style="width:7px;height:7px;border-radius:50%;background:#c8f060;animation:pulse 1.2s ease-in-out .4s infinite"></div>
+      </div>
+      <div style="font-family:'DM Mono',monospace;font-size:11px;color:#4a4754;letter-spacing:.1em;margin-top:14px">Carregando ${pinTargetAccount.name}...</div>
+    `;
+    await loadAccountData(currentAccountId);
+    // Update header with account name
+    window._currentAccountName = pinTargetAccount.name;
+    document.getElementById('loading-screen').style.display = 'none';
+    document.getElementById('app-root').style.display = 'block';
+    init();
+    // Add account name + logout button to header
+    setTimeout(() => {
+      const badge = document.getElementById('monthBadge');
+      if (badge) {
+        const accountChip = document.createElement('div');
+        accountChip.style.cssText = 'display:flex;align-items:center;gap:8px;background:#19181d;border:1px solid #2e2c35;padding:6px 14px;font-size:11px;letter-spacing:.08em;margin-top:6px';
+        accountChip.innerHTML = `<span style="color:#c8f060">●</span><span style="color:#8a8694">${pinTargetAccount.name}</span><button onclick="window.logout()" style="background:none;border:none;color:#4a4754;cursor:pointer;font-size:10px;letter-spacing:.08em;font-family:'DM Mono',monospace;margin-left:6px" onmouseover="this.style.color='#f06090'" onmouseout="this.style.color='#4a4754'">sair</button>`;
+        badge.parentNode.insertBefore(accountChip, badge.nextSibling);
+      }
+    }, 200);
+  } else {
+    pinBuffer = '';
+    updatePinDots();
+    // Shake effect
+    const modal = document.getElementById('pinModal');
+    if (modal) { modal.style.animation='shake .3s ease'; setTimeout(()=>modal.style.animation='',400); }
+    renderAccountScreen(window._accounts || [], '⚠ PIN incorreto. Tente novamente.');
+    document.getElementById('pinModal').style.display = 'none';
+  }
+}
+
+window.closePinModal = function() {
+  document.getElementById('pinModal').style.display = 'none';
+  pinBuffer = ''; updatePinDots();
+};
+
+window.showNewAccountForm = function() {
+  document.getElementById('newAccModal').style.display = 'flex';
+  setTimeout(()=>document.getElementById('newAccName').focus(),100);
+};
+
+window.closeNewAccModal = function() {
+  document.getElementById('newAccModal').style.display = 'none';
+};
+
+window.createAccount = async function() {
+  const name = document.getElementById('newAccName').value.trim();
+  const pin = document.getElementById('newAccPin').value.trim();
+  const errEl = document.getElementById('newAccError');
+  errEl.style.display = 'none';
+  if (!name) { errEl.textContent = 'Digite um nome para a conta.'; errEl.style.display='block'; return; }
+  if (!/^\d{4}$/.test(pin)) { errEl.textContent = 'O PIN deve ter exatamente 4 dígitos.'; errEl.style.display='block'; return; }
+  const accounts = window._accounts || [];
+  if (accounts.length >= 5) { errEl.textContent = 'Máximo de 5 contas atingido.'; errEl.style.display='block'; return; }
+  const id = 'acc_' + Date.now();
+  const newAcc = { id, name, pin };
+  const updated = [...accounts, newAcc];
+  window._accounts = updated;
+  await saveAccounts(updated);
+  window.closeNewAccModal();
+  renderAccountScreen(updated);
+};
+
+window.logout = function() {
+  currentAccountId = null;
+  window._currentAccountName = null;
+  ['fin_tx','fin_limits','fin_inst','fin_inc','fin_rec','fin_meta'].forEach(k => localStorage.removeItem(k));
+  // Remove account chip
+  document.querySelectorAll('[data-acc-chip]').forEach(e=>e.remove());
+  document.getElementById('app-root').style.display = 'none';
+  document.getElementById('loading-screen').style.display = 'flex';
+  renderAccountScreen(window._accounts || []);
+};
+
+// ── Init: load accounts and show selection screen ──────────────────────
+async function start() {
+  const accounts = await loadAccounts();
+  window._accounts = accounts;
+  renderAccountScreen(accounts);
+}
+
+start();
+</script>
 <style>
   :root {
     --bg: #0f0e11;
@@ -1027,7 +1300,23 @@
 </head>
 <body>
 
-<div class="header">
+<!-- Loading / Account selection screen -->
+<div id="loading-screen" style="position:fixed;inset:0;background:#0f0e11;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;gap:20px;overflow-y:auto;">
+  <style>
+    @keyframes shake { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-8px)} 40%,80%{transform:translateX(8px)} }
+    @keyframes pulse { 0%,80%,100%{opacity:.2;transform:scale(.8)} 40%{opacity:1;transform:scale(1.2)} }
+  </style>
+  <div style="font-family:'DM Serif Display',serif;font-size:36px;color:#f0ede8">Controle <span style="color:#c8f060;font-style:italic">Financeiro</span></div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <div style="width:7px;height:7px;border-radius:50%;background:#c8f060;animation:pulse 1.2s ease-in-out infinite"></div>
+    <div style="width:7px;height:7px;border-radius:50%;background:#c8f060;animation:pulse 1.2s ease-in-out .2s infinite"></div>
+    <div style="width:7px;height:7px;border-radius:50%;background:#c8f060;animation:pulse 1.2s ease-in-out .4s infinite"></div>
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:11px;color:#4a4754;letter-spacing:.1em">Carregando...</div>
+</div>
+
+<div id="app-root" style="display:none">
+
   <h1>Controle<br><span>Financeiro</span></h1>
   <div class="month-badge" id="monthBadge"><span class="status-dot" id="statusDot" style="background:var(--text-dimmer)"></span>— / —</div>
 </div>
@@ -1725,6 +2014,7 @@ function importCsvRows() {
 
   save();
   localStorage.setItem('fin_inc', JSON.stringify(incomes));
+  syncToFirebase();
   clearCsv();
   render();
   showToast(`✓ ${imported} gastos e ${skippedIncome} receitas importados!`);
@@ -1748,6 +2038,7 @@ function addRecorrente() {
   if (!nome || !cat || !sub || val <= 0) { showToast('Preencha todos os campos.'); return; }
   recorrentes.push({ id: Date.now(), nome, cat, sub, val });
   localStorage.setItem('fin_rec', JSON.stringify(recorrentes));
+  syncToFirebase();
   document.getElementById('recNome').value = '';
   document.getElementById('recVal').value = '';
   renderRecorList(); render();
@@ -1757,6 +2048,7 @@ function addRecorrente() {
 function deleteRecorrente(id) {
   recorrentes = recorrentes.filter(r => r.id !== id);
   localStorage.setItem('fin_rec', JSON.stringify(recorrentes));
+  syncToFirebase();
   renderRecorList(); render();
   showToast('Recorrente removido.');
 }
@@ -1794,7 +2086,7 @@ function toggleMetaEdit() {
   const area = document.getElementById('metaEditArea');
   if (area.querySelector('input')) {
     const v = parseFloat(area.querySelector('input').value);
-    if (v > 0) { metaGasto = v; localStorage.setItem('fin_meta', v); }
+    if (v > 0) { metaGasto = v; localStorage.setItem('fin_meta', v); syncToFirebase(); }
     else { metaGasto = 0; localStorage.removeItem('fin_meta'); }
     area.innerHTML = `<button class="meta-edit-btn" onclick="toggleMetaEdit()">${metaGasto > 0 ? '✎ Editar Meta' : '⊕ Definir Meta'}</button>`;
     render();
@@ -1952,6 +2244,7 @@ function addIncome() {
 
   incomes.push({ id: Date.now(), desc, val, date, tipo });
   localStorage.setItem('fin_inc', JSON.stringify(incomes));
+  syncToFirebase();
 
   document.getElementById('incDesc').value = '';
   document.getElementById('incVal').value = '';
@@ -1964,6 +2257,7 @@ function addIncome() {
 function deleteIncome(id) {
   incomes = incomes.filter(i => i.id !== id);
   localStorage.setItem('fin_inc', JSON.stringify(incomes));
+  syncToFirebase();
   renderIncomeList();
   render();
   showToast('Receita removida.');
@@ -2089,6 +2383,7 @@ function addInstallment() {
   const inst = { id: Date.now(), nome, cat, sub, val, total, startYear: sy, startMonth: sm - 1 };
   installments.push(inst);
   localStorage.setItem('fin_inst', JSON.stringify(installments));
+  syncToFirebase();
 
   document.getElementById('instNome').value = '';
   document.getElementById('instVal').value = '';
@@ -2102,6 +2397,7 @@ function addInstallment() {
 function deleteInstallment(id) {
   installments = installments.filter(i => i.id !== id);
   localStorage.setItem('fin_inst', JSON.stringify(installments));
+  syncToFirebase();
   renderInstallmentList();
   render();
   showToast('Parcelado removido.');
@@ -2186,6 +2482,7 @@ function saveLimits() {
     else delete limits[key];
   });
   localStorage.setItem('fin_limits', JSON.stringify(limits));
+  syncToFirebase();
   render();
   showToast('Limites salvos com sucesso!');
 }
@@ -2193,6 +2490,7 @@ function saveLimits() {
 function clearLimits() {
   limits = {};
   localStorage.setItem('fin_limits', '{}');
+  syncToFirebase();
   renderLimitsForm();
   render();
   showToast('Limites removidos.');
@@ -2336,6 +2634,7 @@ function saveNota() {
   const key = getCycleNoteKey();
   if (ta.value.trim()) localStorage.setItem(key, ta.value);
   else localStorage.removeItem(key);
+  syncToFirebase();
   const saved = document.getElementById('notasSaved');
   saved.classList.add('show');
   setTimeout(() => saved.classList.remove('show'), 1800);
@@ -2424,6 +2723,7 @@ function importBackup(event) {
           localStorage.setItem('fin_limits', JSON.stringify(limits));
           if (metaGasto) localStorage.setItem('fin_meta', metaGasto);
           if (data.notas) Object.entries(data.notas).forEach(([k,v]) => localStorage.setItem(k, v));
+          syncToFirebase();
           loadNota(); render(); renderBackupStats();
           showToast('Backup importado com sucesso!');
         }
@@ -2555,6 +2855,34 @@ function deleteTransaction(id) {
 
 function save() {
   localStorage.setItem('fin_tx', JSON.stringify(transactions));
+  syncToFirebase();
+}
+
+function getAllNotas() {
+  const notas = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('fin_nota_')) notas[k] = localStorage.getItem(k);
+  }
+  return notas;
+}
+
+let syncTimer = null;
+function syncToFirebase() {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    if (window.firebaseSave) {
+      await window.firebaseSave({
+        fin_tx: localStorage.getItem('fin_tx') || '[]',
+        fin_limits: localStorage.getItem('fin_limits') || '{}',
+        fin_inst: localStorage.getItem('fin_inst') || '[]',
+        fin_inc: localStorage.getItem('fin_inc') || '[]',
+        fin_rec: localStorage.getItem('fin_rec') || '[]',
+        fin_meta: localStorage.getItem('fin_meta') || '0',
+        notas: getAllNotas()
+      });
+    }
+  }, 1500);
 }
 
 function fmt(v) {
@@ -2989,7 +3317,8 @@ function showToast(msg, type) {
   setTimeout(() => el.classList.remove('show'), 4000);
 }
 
-init();
+// init() is called by Firebase loader above
 </script>
+</div><!-- end app-root -->
 </body>
 </html>

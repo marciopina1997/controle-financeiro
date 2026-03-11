@@ -9,7 +9,7 @@
 <script type="module">
 // ── Firebase Setup ─────────────────────────────────────────────────────
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, doc, getDoc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCShbbJudp_Iro1rNQkAlRp74mkKAOyhHA",
@@ -23,6 +23,69 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
+// ── PIN Hashing (SHA-256) ──────────────────────────────────────────────
+async function hashPin(pin) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode('fin_salt_2024_' + pin);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hashBuffer)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+// ── Security: lockout & session timeout ───────────────────────────────
+const MAX_ATTEMPTS = 3;
+const LOCKOUT_MS = 5 * 60 * 1000; // 5 minutes
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+let sessionTimer = null;
+
+function getLockoutKey(id) { return 'fin_lockout_' + id; }
+function getAttemptsKey(id) { return 'fin_attempts_' + id; }
+
+function isLocked(id) {
+  const lockout = localStorage.getItem(getLockoutKey(id));
+  if (!lockout) return false;
+  if (Date.now() < parseInt(lockout)) return true;
+  localStorage.removeItem(getLockoutKey(id));
+  localStorage.removeItem(getAttemptsKey(id));
+  return false;
+}
+
+function getLockoutRemaining(id) {
+  const lockout = localStorage.getItem(getLockoutKey(id));
+  if (!lockout) return 0;
+  return Math.max(0, Math.ceil((parseInt(lockout) - Date.now()) / 1000));
+}
+
+function registerFailedAttempt(id) {
+  const key = getAttemptsKey(id);
+  const attempts = parseInt(localStorage.getItem(key) || '0') + 1;
+  localStorage.setItem(key, attempts);
+  if (attempts >= MAX_ATTEMPTS) {
+    localStorage.setItem(getLockoutKey(id), Date.now() + LOCKOUT_MS);
+    localStorage.removeItem(key);
+    return { locked: true, attempts };
+  }
+  return { locked: false, attempts, remaining: MAX_ATTEMPTS - attempts };
+}
+
+function clearFailedAttempts(id) {
+  localStorage.removeItem(getAttemptsKey(id));
+  localStorage.removeItem(getLockoutKey(id));
+}
+
+function startSessionTimer() {
+  clearTimeout(sessionTimer);
+  sessionTimer = setTimeout(() => {
+    if (currentAccountId) {
+      alert('Sessão encerrada por inatividade. Faça login novamente.');
+      window.logout();
+    }
+  }, SESSION_TIMEOUT_MS);
+}
+
+function resetSessionTimer() {
+  if (currentAccountId) startSessionTimer();
+}
+
 // ── Account Management ─────────────────────────────────────────────────
 let currentAccountId = null;
 
@@ -35,7 +98,6 @@ window.firebaseSave = async function(data) {
   catch(e) { console.error("Erro ao salvar:", e); }
 };
 
-// Load account list from Firebase
 async function loadAccounts() {
   try {
     const snap = await getDoc(getAccountsRef());
@@ -48,7 +110,6 @@ async function saveAccounts(list) {
   catch(e) { console.error("Erro ao salvar contas:", e); }
 }
 
-// Load data for a specific account
 async function loadAccountData(accountId) {
   try {
     const snap = await getDoc(getAccountDataRef(accountId));
@@ -62,7 +123,6 @@ async function loadAccountData(accountId) {
       localStorage.setItem('fin_meta', data.fin_meta || '0');
       if (data.notas) Object.entries(data.notas).forEach(([k,v]) => localStorage.setItem(k, v));
     } else {
-      // New account — clear localStorage
       ['fin_tx','fin_limits','fin_inst','fin_inc','fin_rec','fin_meta'].forEach(k => localStorage.removeItem(k));
     }
   } catch(e) { console.error("Erro ao carregar conta:", e); }
@@ -72,6 +132,10 @@ async function loadAccountData(accountId) {
 function renderAccountScreen(accounts, errorMsg) {
   const colors = ['#c8f060','#60d4f0','#f06090','#a060f0','#f0a060'];
   document.getElementById('loading-screen').innerHTML = `
+    <style>
+      @keyframes shake { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-8px)} 40%,80%{transform:translateX(8px)} }
+      @keyframes pulse { 0%,80%,100%{opacity:.2;transform:scale(.8)} 40%{opacity:1;transform:scale(1.2)} }
+    </style>
     <div style="width:100%;max-width:480px;padding:24px">
       <div style="text-align:center;margin-bottom:40px">
         <div style="font-family:'DM Serif Display',serif;font-size:36px;color:#f0ede8;line-height:1">
@@ -81,39 +145,40 @@ function renderAccountScreen(accounts, errorMsg) {
       </div>
 
       <div id="accountList" style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px">
-        ${accounts.map((acc,i) => `
-          <div onclick="window.selectAccount('${acc.id}')" style="
-            background:#19181d;border:1px solid #2e2c35;padding:18px 20px;
-            cursor:pointer;display:flex;align-items:center;gap:14px;
-            transition:border-color .2s;border-left:3px solid ${colors[i%colors.length]}
-          " onmouseover="this.style.borderColor='${colors[i%colors.length]}'" onmouseout="this.style.borderColor='#2e2c35';this.style.borderLeftColor='${colors[i%colors.length]}'">
-            <div style="width:38px;height:38px;border-radius:50%;background:${colors[i%colors.length]}22;border:1px solid ${colors[i%colors.length]}44;display:flex;align-items:center;justify-content:center;font-family:'DM Serif Display',serif;font-size:18px;color:${colors[i%colors.length]};flex-shrink:0">
-              ${acc.name.charAt(0).toUpperCase()}
+        ${accounts.map((acc,i) => {
+          const locked = isLocked(acc.id);
+          const remaining = locked ? getLockoutRemaining(acc.id) : 0;
+          const mins = Math.ceil(remaining / 60);
+          return `
+          <div style="background:#19181d;border:1px solid #2e2c35;padding:18px 20px;display:flex;align-items:center;gap:14px;transition:border-color .2s;border-left:3px solid ${locked?'#f06060':colors[i%colors.length]}"
+            ${!locked?`onmouseover="this.style.borderColor='${colors[i%colors.length]}'" onmouseout="this.style.borderColor='#2e2c35';this.style.borderLeftColor='${colors[i%colors.length]}'"`:''}>
+            <div onclick="${locked?'':'window.selectAccount(\''+acc.id+'\')'}" style="width:38px;height:38px;border-radius:50%;background:${locked?'#f0606022':colors[i%colors.length]+'22'};border:1px solid ${locked?'#f0606044':colors[i%colors.length]+'44'};display:flex;align-items:center;justify-content:center;font-family:'DM Serif Display',serif;font-size:18px;color:${locked?'#f06060':colors[i%colors.length]};flex-shrink:0;cursor:${locked?'default':'pointer'}">
+              ${locked ? '🔒' : acc.name.charAt(0).toUpperCase()}
             </div>
-            <div style="flex:1">
-              <div style="font-size:14px;color:#f0ede8">${acc.name}</div>
-              <div style="font-size:10px;color:#4a4754;margin-top:2px;letter-spacing:.06em">🔒 protegida por PIN</div>
+            <div onclick="${locked?'':'window.selectAccount(\''+acc.id+'\')'}" style="flex:1;cursor:${locked?'default':'pointer'}">
+              <div style="font-size:14px;color:${locked?'#8a8694':'#f0ede8'}">${acc.name}</div>
+              <div style="font-size:10px;color:${locked?'#f06060':'#4a4754'};margin-top:2px;letter-spacing:.06em">${locked?`⛔ bloqueada por ${mins} min`:'🔒 protegida por PIN'}</div>
             </div>
-            <div style="color:#4a4754;font-size:18px">›</div>
-          </div>
-        `).join('')}
+            <button onclick="window.showEditAccountForm('${acc.id}','${acc.name}')" style="background:none;border:1px solid #2e2c3500;color:#4a4754;font-size:13px;cursor:pointer;padding:6px 8px;line-height:1;transition:all .2s"
+              onmouseover="this.style.color='#60d4f0';this.style.borderColor='#60d4f044';this.style.background='#60d4f011'" onmouseout="this.style.color='#4a4754';this.style.borderColor='#2e2c3500';this.style.background='none'" title="Editar conta">✎</button>
+            <button onclick="window.confirmDeleteAccount('${acc.id}','${acc.name}')" style="background:none;border:1px solid #2e2c3500;color:#4a4754;font-size:16px;cursor:pointer;padding:6px 8px;line-height:1;transition:all .2s"
+              onmouseover="this.style.color='#f06090';this.style.borderColor='#f0609044';this.style.background='#f0606011'" onmouseout="this.style.color='#4a4754';this.style.borderColor='#2e2c3500';this.style.background='none'" title="Apagar conta">✕</button>
+            ${!locked?`<div onclick="window.selectAccount('${acc.id}')" style="color:#4a4754;font-size:18px;cursor:pointer">›</div>`:''}
+          </div>`;}
+        ).join('')}
       </div>
 
       ${errorMsg ? `<div style="background:#f0606022;border:1px solid #f0606044;color:#f06060;padding:10px 14px;font-size:11px;letter-spacing:.06em;margin-bottom:16px;text-align:center">${errorMsg}</div>` : ''}
 
-      <button onclick="window.showNewAccountForm()" style="
-        width:100%;background:none;border:1px dashed #2e2c35;color:#8a8694;
-        padding:14px;font-family:'DM Mono',monospace;font-size:11px;
-        letter-spacing:.1em;text-transform:uppercase;cursor:pointer;
-        transition:all .2s
-      " onmouseover="this.style.borderColor='#c8f060';this.style.color='#c8f060'" onmouseout="this.style.borderColor='#2e2c35';this.style.color='#8a8694'">
+      <button onclick="window.showNewAccountForm()" style="width:100%;background:none;border:1px dashed #2e2c35;color:#8a8694;padding:14px;font-family:'DM Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:all .2s"
+        onmouseover="this.style.borderColor='#c8f060';this.style.color='#c8f060'" onmouseout="this.style.borderColor='#2e2c35';this.style.color='#8a8694'">
         ＋ Nova Conta
       </button>
     </div>
 
     <!-- PIN Modal -->
     <div id="pinModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);align-items:center;justify-content:center;z-index:100">
-      <div style="background:#19181d;border:1px solid #2e2c35;padding:32px;min-width:300px;text-align:center">
+      <div id="pinBox" style="background:#19181d;border:1px solid #2e2c35;padding:32px;min-width:300px;text-align:center">
         <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:6px" id="pinTitle">Digite o PIN</div>
         <div style="font-size:11px;color:#4a4754;margin-bottom:24px;letter-spacing:.06em" id="pinSubtitle">4 dígitos</div>
         <div id="pinDots" style="display:flex;justify-content:center;gap:12px;margin-bottom:28px">
@@ -121,11 +186,8 @@ function renderAccountScreen(accounts, errorMsg) {
         </div>
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:220px;margin:0 auto">
           ${[1,2,3,4,5,6,7,8,9,'',0,'←'].map(k=>`
-            <button onclick="window.pinKey('${k}')" style="
-              background:#0f0e11;border:1px solid #2e2c35;color:${k===''?'transparent':'#f0ede8'};
-              font-family:'DM Mono',monospace;font-size:18px;padding:14px;cursor:${k===''?'default':'pointer'};
-              transition:all .15s;pointer-events:${k===''?'none':'auto'}
-            " ${k!==''?`onmouseover="this.style.borderColor='#c8f060'" onmouseout="this.style.borderColor='#2e2c35'"`:''}>${k}</button>
+            <button onclick="window.pinKey('${k}')" style="background:#0f0e11;border:1px solid #2e2c35;color:${k===''?'transparent':'#f0ede8'};font-family:'DM Mono',monospace;font-size:18px;padding:14px;cursor:${k===''?'default':'pointer'};transition:all .15s;pointer-events:${k===''?'none':'auto'}"
+              ${k!==''?`onmouseover="this.style.borderColor='#c8f060'" onmouseout="this.style.borderColor='#2e2c35'"`:''}>${k}</button>
           `).join('')}
         </div>
         <button onclick="window.closePinModal()" style="margin-top:20px;background:none;border:none;color:#4a4754;font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;letter-spacing:.08em">Cancelar</button>
@@ -151,18 +213,50 @@ function renderAccountScreen(accounts, errorMsg) {
         </div>
       </div>
     </div>
+
+    <!-- Edit Account Modal -->
+    <div id="editAccModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);align-items:center;justify-content:center;z-index:100">
+      <div style="background:#19181d;border:1px solid #2e2c35;padding:32px;min-width:320px">
+        <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:6px">Editar Conta</div>
+        <div style="font-size:11px;color:#4a4754;margin-bottom:20px;letter-spacing:.06em">Confirme o PIN atual para salvar alterações</div>
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8a8694;margin-bottom:6px">Novo nome</div>
+          <input id="editAccName" type="text" maxlength="20" style="width:100%;background:#0f0e11;border:1px solid #2e2c35;color:#f0ede8;padding:10px 12px;font-family:'DM Mono',monospace;font-size:13px;outline:none">
+        </div>
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8a8694;margin-bottom:6px">Novo PIN (deixe vazio para não alterar)</div>
+          <input id="editAccPin" type="password" inputmode="numeric" placeholder="••••" maxlength="4" style="width:100%;background:#0f0e11;border:1px solid #2e2c35;color:#f0ede8;padding:10px 12px;font-family:'DM Mono',monospace;font-size:20px;outline:none;letter-spacing:.3em;text-align:center">
+        </div>
+        <div style="margin-bottom:20px">
+          <div style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8a8694;margin-bottom:6px">PIN atual (obrigatório)</div>
+          <input id="editAccCurrentPin" type="password" inputmode="numeric" placeholder="••••" maxlength="4" style="width:100%;background:#0f0e11;border:1px solid #2e2c35;color:#f0ede8;padding:10px 12px;font-family:'DM Mono',monospace;font-size:20px;outline:none;letter-spacing:.3em;text-align:center">
+        </div>
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8a8694;margin-bottom:6px">Exportar backup desta conta</div>
+          <button onclick="window.exportAccountBackup()" style="width:100%;background:none;border:1px solid #50d890;color:#50d890;padding:9px;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">⬇ Exportar JSON</button>
+        </div>
+        <div id="editAccError" style="display:none;background:#f0606022;border:1px solid #f0606044;color:#f06060;padding:8px 12px;font-size:11px;margin-bottom:14px;text-align:center"></div>
+        <div style="display:flex;gap:8px">
+          <button onclick="window.closeEditAccModal()" style="flex:1;background:none;border:1px solid #2e2c35;color:#8a8694;padding:10px;font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">Cancelar</button>
+          <button onclick="window.saveEditAccount()" style="flex:1;background:#c8f060;color:#0f0e11;border:none;padding:10px;font-family:'DM Mono',monospace;font-size:11px;font-weight:500;cursor:pointer;letter-spacing:.08em">✓ Salvar</button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
-// PIN logic
+// ── PIN Logic ──────────────────────────────────────────────────────────
 let pinBuffer = '';
 let pinTargetAccount = null;
-let pinMode = 'login'; // 'login'
 
 window.selectAccount = function(id) {
-  const accounts = window._accounts || [];
-  const acc = accounts.find(a => a.id === id);
+  const acc = (window._accounts || []).find(a => a.id === id);
   if (!acc) return;
+  if (isLocked(acc.id)) {
+    const mins = Math.ceil(getLockoutRemaining(acc.id) / 60);
+    renderAccountScreen(window._accounts, `⛔ Conta bloqueada. Tente em ${mins} minuto(s).`);
+    return;
+  }
   pinTargetAccount = acc;
   pinBuffer = '';
   updatePinDots();
@@ -188,7 +282,12 @@ function updatePinDots() {
 
 async function validatePin() {
   if (!pinTargetAccount) return;
-  if (pinBuffer === pinTargetAccount.pin) {
+  const enteredHash = await hashPin(pinBuffer);
+  const storedPin = pinTargetAccount.pin;
+  const isValid = storedPin.length === 64 ? enteredHash === storedPin : pinBuffer === storedPin;
+
+  if (isValid) {
+    clearFailedAttempts(pinTargetAccount.id);
     document.getElementById('pinModal').style.display = 'none';
     currentAccountId = pinTargetAccount.id;
     document.getElementById('loading-screen').innerHTML = `
@@ -201,29 +300,38 @@ async function validatePin() {
       <div style="font-family:'DM Mono',monospace;font-size:11px;color:#4a4754;letter-spacing:.1em;margin-top:14px">Carregando ${pinTargetAccount.name}...</div>
     `;
     await loadAccountData(currentAccountId);
-    // Update header with account name
     window._currentAccountName = pinTargetAccount.name;
     document.getElementById('loading-screen').style.display = 'none';
     document.getElementById('app-root').style.display = 'block';
     init();
-    // Add account name + logout button to header
+    startSessionTimer();
+    // Reset session timer on any user interaction
+    document.addEventListener('click', resetSessionTimer);
+    document.addEventListener('keydown', resetSessionTimer);
+    // Add account chip to header
     setTimeout(() => {
-      const badge = document.getElementById('monthBadge');
-      if (badge) {
-        const accountChip = document.createElement('div');
-        accountChip.style.cssText = 'display:flex;align-items:center;gap:8px;background:#19181d;border:1px solid #2e2c35;padding:6px 14px;font-size:11px;letter-spacing:.08em;margin-top:6px';
-        accountChip.innerHTML = `<span style="color:#c8f060">●</span><span style="color:#8a8694">${pinTargetAccount.name}</span><button onclick="window.logout()" style="background:none;border:none;color:#4a4754;cursor:pointer;font-size:10px;letter-spacing:.08em;font-family:'DM Mono',monospace;margin-left:6px" onmouseover="this.style.color='#f06090'" onmouseout="this.style.color='#4a4754'">sair</button>`;
-        badge.parentNode.insertBefore(accountChip, badge.nextSibling);
+      const headerRight = document.querySelector('.header > div');
+      if (headerRight) {
+        const chip = document.createElement('div');
+        chip.id = 'accChip';
+        chip.style.cssText = 'display:flex;align-items:center;gap:8px;background:#19181d;border:1px solid #2e2c35;padding:6px 14px;font-size:11px;letter-spacing:.08em';
+        chip.innerHTML = `<span style="color:#c8f060">●</span><span style="color:#8a8694">${pinTargetAccount.name}</span><button onclick="window.logout()" style="background:none;border:none;color:#4a4754;cursor:pointer;font-size:10px;letter-spacing:.08em;font-family:'DM Mono',monospace;margin-left:6px" onmouseover="this.style.color='#f06090'" onmouseout="this.style.color='#4a4754'">sair</button>`;
+        headerRight.appendChild(chip);
       }
     }, 200);
   } else {
+    const result = registerFailedAttempt(pinTargetAccount.id);
     pinBuffer = '';
     updatePinDots();
-    // Shake effect
-    const modal = document.getElementById('pinModal');
-    if (modal) { modal.style.animation='shake .3s ease'; setTimeout(()=>modal.style.animation='',400); }
-    renderAccountScreen(window._accounts || [], '⚠ PIN incorreto. Tente novamente.');
-    document.getElementById('pinModal').style.display = 'none';
+    const box = document.getElementById('pinBox');
+    if (box) { box.style.animation='shake .3s ease'; setTimeout(()=>box.style.animation='',400); }
+    if (result.locked) {
+      document.getElementById('pinModal').style.display = 'none';
+      renderAccountScreen(window._accounts || [], `⛔ Conta bloqueada por 5 minutos após ${MAX_ATTEMPTS} tentativas erradas.`);
+    } else {
+      document.getElementById('pinSubtitle').textContent = `⚠ PIN incorreto — ${result.remaining} tentativa(s) restante(s)`;
+      document.getElementById('pinSubtitle').style.color = '#f06060';
+    }
   }
 }
 
@@ -232,9 +340,10 @@ window.closePinModal = function() {
   pinBuffer = ''; updatePinDots();
 };
 
+// ── New Account ────────────────────────────────────────────────────────
 window.showNewAccountForm = function() {
   document.getElementById('newAccModal').style.display = 'flex';
-  setTimeout(()=>document.getElementById('newAccName').focus(),100);
+  setTimeout(()=>document.getElementById('newAccName').focus(), 100);
 };
 
 window.closeNewAccModal = function() {
@@ -251,26 +360,113 @@ window.createAccount = async function() {
   const accounts = window._accounts || [];
   if (accounts.length >= 5) { errEl.textContent = 'Máximo de 5 contas atingido.'; errEl.style.display='block'; return; }
   const id = 'acc_' + Date.now();
-  const newAcc = { id, name, pin };
-  const updated = [...accounts, newAcc];
+  const pinHash = await hashPin(pin);
+  const updated = [...accounts, { id, name, pin: pinHash }];
   window._accounts = updated;
   await saveAccounts(updated);
   window.closeNewAccModal();
   renderAccountScreen(updated);
 };
 
+// ── Edit Account ───────────────────────────────────────────────────────
+let editTargetId = null;
+
+window.showEditAccountForm = function(id, name) {
+  editTargetId = id;
+  document.getElementById('editAccName').value = name;
+  document.getElementById('editAccPin').value = '';
+  document.getElementById('editAccCurrentPin').value = '';
+  document.getElementById('editAccError').style.display = 'none';
+  document.getElementById('editAccModal').style.display = 'flex';
+  // Store id for export
+  window._editTargetId = id;
+};
+
+window.closeEditAccModal = function() {
+  document.getElementById('editAccModal').style.display = 'none';
+  editTargetId = null;
+};
+
+window.saveEditAccount = async function() {
+  const newName = document.getElementById('editAccName').value.trim();
+  const newPin = document.getElementById('editAccPin').value.trim();
+  const currentPin = document.getElementById('editAccCurrentPin').value.trim();
+  const errEl = document.getElementById('editAccError');
+  errEl.style.display = 'none';
+
+  if (!newName) { errEl.textContent = 'O nome não pode estar vazio.'; errEl.style.display='block'; return; }
+  if (!currentPin) { errEl.textContent = 'Digite o PIN atual para confirmar.'; errEl.style.display='block'; return; }
+  if (newPin && !/^\d{4}$/.test(newPin)) { errEl.textContent = 'O novo PIN deve ter exatamente 4 dígitos.'; errEl.style.display='block'; return; }
+
+  const acc = (window._accounts || []).find(a => a.id === editTargetId);
+  if (!acc) return;
+
+  // Validate current PIN
+  const currentHash = await hashPin(currentPin);
+  const isValid = acc.pin.length === 64 ? currentHash === acc.pin : currentPin === acc.pin;
+  if (!isValid) { errEl.textContent = '⚠ PIN atual incorreto.'; errEl.style.display='block'; return; }
+
+  // Apply changes
+  const newPinHash = newPin ? await hashPin(newPin) : acc.pin;
+  const updated = (window._accounts || []).map(a =>
+    a.id === editTargetId ? { ...a, name: newName, pin: newPinHash } : a
+  );
+  window._accounts = updated;
+  await saveAccounts(updated);
+  window.closeEditAccModal();
+  renderAccountScreen(updated);
+};
+
+// ── Export backup for a specific account ──────────────────────────────
+window.exportAccountBackup = async function() {
+  const id = window._editTargetId;
+  if (!id) return;
+  const acc = (window._accounts || []).find(a => a.id === id);
+  try {
+    const snap = await getDoc(getAccountDataRef(id));
+    const data = snap.exists() ? snap.data() : {};
+    const blob = new Blob([JSON.stringify({ conta: acc?.name, exportedAt: new Date().toISOString(), ...data }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup_${acc?.name || id}_${new Date().toISOString().split('T')[0]}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e) { alert('Erro ao exportar backup.'); }
+};
+
+// ── Delete Account ─────────────────────────────────────────────────────
+window.confirmDeleteAccount = function(id, name) {
+  const confirmed = window.confirm(`Apagar a conta "${name}"?\n\nTodos os dados financeiros desta conta serão perdidos permanentemente.`);
+  if (confirmed) window.deleteAccount(id);
+};
+
+window.deleteAccount = async function(id) {
+  try {
+    const updated = (window._accounts || []).filter(a => a.id !== id);
+    window._accounts = updated;
+    await saveAccounts(updated);
+    await deleteDoc(doc(db, "financas", "conta_" + id));
+  } catch(e) { console.error("Erro ao apagar conta:", e); }
+  renderAccountScreen(window._accounts || []);
+};
+
+// ── Logout ─────────────────────────────────────────────────────────────
 window.logout = function() {
+  clearTimeout(sessionTimer);
+  document.removeEventListener('click', resetSessionTimer);
+  document.removeEventListener('keydown', resetSessionTimer);
   currentAccountId = null;
   window._currentAccountName = null;
   ['fin_tx','fin_limits','fin_inst','fin_inc','fin_rec','fin_meta'].forEach(k => localStorage.removeItem(k));
-  // Remove account chip
-  document.querySelectorAll('[data-acc-chip]').forEach(e=>e.remove());
+  const chip = document.getElementById('accChip');
+  if (chip) chip.remove();
   document.getElementById('app-root').style.display = 'none';
   document.getElementById('loading-screen').style.display = 'flex';
   renderAccountScreen(window._accounts || []);
 };
 
-// ── Init: load accounts and show selection screen ──────────────────────
+// ── Start ──────────────────────────────────────────────────────────────
 async function start() {
   const accounts = await loadAccounts();
   window._accounts = accounts;
@@ -340,6 +536,51 @@ start();
     grid-template-columns: 380px 1fr;
     gap: 24px;
     align-items: start;
+  }
+
+  /* ── Mobile Responsive ───────────────────────────────────────────── */
+  @media (max-width: 768px) {
+    body { padding: 16px 12px; font-size: 14px; }
+
+    .header { margin-bottom: 20px; padding-bottom: 16px; flex-wrap: wrap; gap: 10px; }
+    .header h1 { font-size: 30px; }
+    .month-badge { font-size: 10px; padding: 6px 10px; }
+
+    .layout { grid-template-columns: 1fr; gap: 16px; }
+
+    .summary-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .summary-card .value { font-size: 20px; }
+
+    .balance-row { grid-template-columns: 1fr; gap: 8px; }
+    .balance-card .value { font-size: 22px; }
+
+    .panel { padding: 16px; }
+
+    .tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+    .tab-btn { font-size: 9px; padding: 8px 10px; }
+
+    .left-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .left-tab-btn { font-size: 9px; padding: 8px 6px; }
+
+    .form-group select, .form-group input { font-size: 16px; padding: 12px; }
+    .btn-add { padding: 16px; font-size: 13px; }
+
+    .cat-table th, .cat-table td { font-size: 11px; padding: 6px 4px; }
+    .tx-item { flex-wrap: wrap; gap: 6px; padding: 10px 0; }
+    .tx-amount { font-size: 14px; }
+
+    .two-col { grid-template-columns: 1fr !important; }
+
+    #dashboard-panel { display: block; }
+
+    /* Bigger touch targets on mobile */
+    .tx-del, .tx-edit { font-size: 18px; padding: 6px 10px; }
+    .sort-btn { padding: 6px 12px; font-size: 10px; }
+  }
+
+  @media (max-width: 480px) {
+    .summary-grid { grid-template-columns: 1fr; }
+    .header h1 { font-size: 26px; }
   }
 
   .panel {
@@ -1317,9 +1558,15 @@ start();
 
 <div id="app-root" style="display:none">
 
-  <h1>Controle<br><span>Financeiro</span></h1>
-  <div class="month-badge" id="monthBadge"><span class="status-dot" id="statusDot" style="background:var(--text-dimmer)"></span>— / —</div>
+<div class="header">
+  <h1>Controle <span>Financeiro</span></h1>
+  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+    <div class="month-badge" id="monthBadge"><span class="status-dot" id="statusDot" style="background:var(--text-dimmer)"></span>— / —</div>
+  </div>
 </div>
+
+<!-- Dashboard Rápido -->
+<div id="dashboard-panel" style="margin-bottom:16px"></div>
 
 <div class="layout">
   <!-- LEFT: Input Form + Limits -->
@@ -2948,6 +3195,7 @@ function render() {
 
   updateMetaBar(total);
   updateStatusDot(totalIncome > 0 ? (total / totalIncome * 100) : 0);
+  renderDashboard();
   renderCatTable(monthTx, total, prevBycat);
   renderChart(monthTx);
   renderTxList(monthTx);
@@ -3315,6 +3563,131 @@ function showToast(msg, type) {
   el.style.color = 'var(--bg)';
   el.classList.add('show');
   setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+// ── Dashboard Rápido ──────────────────────────────────────────────────
+function getHistoricalAvgBycat(months = 3) {
+  const avgs = {};
+  const { billingMonth: bm, billingYear: by } = currentCycle;
+  for (let i = 1; i <= months; i++) {
+    let m = bm - i, y = by;
+    if (m < 0) { m += 12; y--; }
+    const { start, end } = getBillingCycle(m, y);
+    const manual = transactions.filter(t => { const d = new Date(t.date+'T00:00:00'); return d >= start && d <= end; });
+    const inst = getInstallmentTxForCycle(m, y);
+    const rec = getRecorrenteTx(m, y);
+    [...manual, ...inst, ...rec].forEach(t => {
+      if (!avgs[t.cat]) avgs[t.cat] = { sum: 0, count: 0 };
+      avgs[t.cat].sum += t.val;
+      avgs[t.cat].count++;
+    });
+  }
+  const result = {};
+  Object.entries(avgs).forEach(([cat, d]) => { result[cat] = d.sum / months; });
+  return result;
+}
+
+function renderDashboard() {
+  const panel = document.getElementById('dashboard-panel');
+  if (!panel) return;
+
+  const { billingMonth: bm, billingYear: by, start, end } = currentCycle;
+  const manual = transactions.filter(t => { const d = new Date(t.date+'T00:00:00'); return d >= start && d <= end; });
+  const monthTx = [...manual, ...getInstallmentTxForCycle(bm, by), ...getRecorrenteTx(bm, by)];
+  const cycleInc = getCycleIncomes();
+
+  const total = monthTx.reduce((s,t) => s+t.val, 0);
+  const totalIncome = cycleInc.reduce((s,i) => s+i.val, 0);
+  const saldo = totalIncome - total;
+  const pct = totalIncome > 0 ? (total/totalIncome*100) : 0;
+
+  // Days remaining in cycle
+  const today = new Date();
+  const daysLeft = Math.max(0, Math.ceil((end - today) / 86400000));
+  const daysPassed = Math.max(1, Math.ceil((today - start) / 86400000));
+  const totalDays = Math.ceil((end - start) / 86400000);
+  const projecao = daysPassed < totalDays ? Math.round(total / daysPassed * totalDays) : total;
+
+  // Historical alerts
+  const histAvg = getHistoricalAvgBycat(3);
+  const bycat = {};
+  monthTx.forEach(t => { bycat[t.cat] = (bycat[t.cat]||0) + t.val; });
+  const alerts = Object.entries(bycat)
+    .filter(([cat, val]) => histAvg[cat] && val > histAvg[cat] * 1.2)
+    .map(([cat, val]) => ({ cat, val, avg: histAvg[cat], pctOver: Math.round((val/histAvg[cat]-1)*100) }))
+    .sort((a,b) => b.pctOver - a.pctOver)
+    .slice(0, 3);
+
+  // Top categories
+  const topCats = Object.entries(bycat).sort((a,b) => b[1]-a[1]).slice(0,3);
+
+  const statusColor = pct >= 100 ? '#f06090' : pct >= 80 ? '#f0c040' : '#c8f060';
+
+  panel.innerHTML = `
+    <div style="background:#19181d;border:1px solid #2e2c35;padding:20px;margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div style="font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:#8a8694">Dashboard Rápido</div>
+        <div style="font-size:10px;color:#4a4754;letter-spacing:.06em">${daysLeft} dias restantes no ciclo</div>
+      </div>
+
+      <!-- Progress bar -->
+      <div style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#8a8694;margin-bottom:6px">
+          <span>Gasto do ciclo</span>
+          <span style="color:${statusColor}">${pct.toFixed(1)}% da receita</span>
+        </div>
+        <div style="height:8px;background:#0f0e11;overflow:hidden;border-radius:1px">
+          <div style="height:100%;width:${Math.min(pct,100)}%;background:${statusColor};transition:width .6s ease"></div>
+        </div>
+        ${totalIncome > 0 ? `<div style="display:flex;justify-content:space-between;font-size:9px;color:#4a4754;margin-top:4px"><span>R$ ${fmt(total)} gastos</span><span>R$ ${fmt(totalIncome)} receita</span></div>` : ''}
+      </div>
+
+      <!-- 3 quick stats -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:${alerts.length ? '16px' : '0'}">
+        <div style="background:#0f0e11;border:1px solid #2e2c35;padding:12px;text-align:center">
+          <div style="font-size:9px;color:#8a8694;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px">Saldo</div>
+          <div style="font-family:'DM Serif Display',serif;font-size:18px;color:${saldo>=0?'#c8f060':'#f06090'}">${saldo>=0?'':'− '}R$ ${fmt(Math.abs(saldo))}</div>
+        </div>
+        <div style="background:#0f0e11;border:1px solid #2e2c35;padding:12px;text-align:center">
+          <div style="font-size:9px;color:#8a8694;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px">Projeção</div>
+          <div style="font-family:'DM Serif Display',serif;font-size:18px;color:${totalIncome>0&&projecao>totalIncome?'#f0c040':'#8a8694'}">R$ ${fmt(projecao)}</div>
+        </div>
+        <div style="background:#0f0e11;border:1px solid #2e2c35;padding:12px;text-align:center">
+          <div style="font-size:9px;color:#8a8694;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px">Top gasto</div>
+          <div style="font-size:11px;color:${CAT_COLORS[topCats[0]?.[0]]||'#888'};margin-top:4px">${topCats[0] ? topCats[0][0] : '—'}</div>
+          <div style="font-size:10px;color:#4a4754">${topCats[0] ? 'R$ '+fmt(topCats[0][1]) : ''}</div>
+        </div>
+      </div>
+
+      <!-- Alertas acima da média -->
+      ${alerts.length ? `
+        <div style="border-top:1px solid #2e2c35;padding-top:14px">
+          <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#f0c040;margin-bottom:10px">⚠ Acima da média histórica</div>
+          ${alerts.map(a => `
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #2e2c3555">
+              <div style="width:8px;height:8px;border-radius:50%;background:${CAT_COLORS[a.cat]||'#888'};flex-shrink:0"></div>
+              <div style="flex:1;font-size:11px">${a.cat}</div>
+              <div style="font-size:10px;color:#f0c040">+${a.pctOver}% vs média</div>
+              <div style="font-size:11px;color:#f0ede8">R$ ${fmt(a.val)}</div>
+            </div>
+          `).join('')}
+        </div>
+      ` : '<div style="border-top:1px solid #2e2c35;padding-top:12px;font-size:11px;color:#50d890;text-align:center">✓ Gastos dentro da média histórica</div>'}
+    </div>
+  `;
+}
+
+// ── Alertas históricos no render principal ─────────────────────────────
+function checkHistoricalAlerts(monthTx) {
+  const histAvg = getHistoricalAvgBycat(3);
+  const bycat = {};
+  monthTx.forEach(t => { bycat[t.cat] = (bycat[t.cat]||0) + t.val; });
+  Object.entries(bycat).forEach(([cat, val]) => {
+    if (histAvg[cat] && val > histAvg[cat] * 1.5 && val > 100) {
+      const pctOver = Math.round((val/histAvg[cat]-1)*100);
+      showToast(`📊 ${cat} está ${pctOver}% acima da média!`, 'warn');
+    }
+  });
 }
 
 // init() is called by Firebase loader above

@@ -121,6 +121,7 @@ async function loadAccountData(accountId) {
       localStorage.setItem('fin_inc', data.fin_inc || '[]');
       localStorage.setItem('fin_rec', data.fin_rec || '[]');
       localStorage.setItem('fin_meta', data.fin_meta || '0');
+      if (data.fin_close_day) localStorage.setItem('fin_close_day', data.fin_close_day);
       if (data.notas) Object.entries(data.notas).forEach(([k,v]) => localStorage.setItem(k, v));
     } else {
       ['fin_tx','fin_limits','fin_inst','fin_inc','fin_rec','fin_meta'].forEach(k => localStorage.removeItem(k));
@@ -301,6 +302,8 @@ async function validatePin() {
     `;
     await loadAccountData(currentAccountId);
     window._currentAccountName = pinTargetAccount.name;
+    // Reload CLOSE_DAY from account data
+    CLOSE_DAY = parseInt(localStorage.getItem('fin_close_day') || '25');
     document.getElementById('loading-screen').style.display = 'none';
     document.getElementById('app-root').style.display = 'block';
     init();
@@ -1797,6 +1800,23 @@ start();
           </label>
         </div>
         <div class="backup-stats" id="backupStats"></div>
+
+        <!-- Configuração do ciclo -->
+        <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+          <div class="panel-title">⚙ Ciclo de Fechamento</div>
+          <div style="font-size:11px;color:var(--text-dim);line-height:1.7;margin-bottom:14px">
+            Defina o dia em que seu ciclo <strong style="color:var(--text)">fecha</strong>. O ciclo começa no dia seguinte e termina no dia escolhido do mês seguinte.
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+            <label style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);white-space:nowrap">Dia de fechamento</label>
+            <input type="number" id="closeDayInput" min="1" max="28" value="25"
+              style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--accent);padding:8px 10px;font-family:var(--font-mono);font-size:16px;text-align:center;outline:none"
+              onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+            <span style="font-size:11px;color:var(--text-dim)">de cada mês</span>
+          </div>
+          <div id="cyclePreview" style="font-size:11px;color:var(--text-dim);margin-bottom:12px;padding:8px 10px;background:var(--bg);border:1px solid var(--border)"></div>
+          <button class="btn-add" onclick="saveCloseDay()" style="margin-top:0">✓ Aplicar</button>
+        </div>
       </div>
 
     </div>
@@ -2019,19 +2039,24 @@ let txSortMode = 'data';
 let modalCallback = null;
 
 // Billing cycle: closes on 25th. Cycle for month M = 26/M-1 to 25/M
+// ── Billing cycle day (configurable, default 25) ──────────────────────
+let CLOSE_DAY = parseInt(localStorage.getItem('fin_close_day') || '25');
+
 function getBillingCycle(billingMonth, billingYear) {
+  const closeDay = CLOSE_DAY;
+  const startDay = closeDay + 1;
   let startMonth = billingMonth - 1, startYear = billingYear;
   if (startMonth < 0) { startMonth = 11; startYear--; }
   return {
-    start: new Date(startYear, startMonth, 26),
-    end: new Date(billingYear, billingMonth, 25)
+    start: new Date(startYear, startMonth, startDay),
+    end: new Date(billingYear, billingMonth, closeDay)
   };
 }
 
 function getCurrentCycle() {
   const today = new Date();
   let billingMonth = today.getMonth(), billingYear = today.getFullYear();
-  if (today.getDate() >= 26) {
+  if (today.getDate() > CLOSE_DAY) {
     billingMonth++;
     if (billingMonth > 11) { billingMonth = 0; billingYear++; }
   }
@@ -2079,7 +2104,7 @@ function switchLeftTab(name) {
   if (name === 'parcelados') renderInstallmentList();
   if (name === 'receitas') renderIncomeList();
   if (name === 'recorrentes') renderRecorList();
-  if (name === 'backup') renderBackupStats();
+  if (name === 'backup') { renderBackupStats(); initCloseDayInput(); }
 }
 
 // ── CSV Import ─────────────────────────────────────────────────────────
@@ -3035,6 +3060,7 @@ function init() {
   buildHistFilters();
   loadNota();
   setupEnterKey();
+  initCloseDayInput();
   render();
 }
 
@@ -3126,6 +3152,7 @@ function syncToFirebase() {
         fin_inc: localStorage.getItem('fin_inc') || '[]',
         fin_rec: localStorage.getItem('fin_rec') || '[]',
         fin_meta: localStorage.getItem('fin_meta') || '0',
+        fin_close_day: localStorage.getItem('fin_close_day') || '25',
         notas: getAllNotas()
       });
     }
@@ -3688,6 +3715,45 @@ function checkHistoricalAlerts(monthTx) {
       showToast(`📊 ${cat} está ${pctOver}% acima da média!`, 'warn');
     }
   });
+}
+
+function saveCloseDay() {
+  const input = document.getElementById('closeDayInput');
+  const day = parseInt(input.value);
+  if (isNaN(day) || day < 1 || day > 28) {
+    showToast('Escolha um dia entre 1 e 28.', 'warn'); return;
+  }
+  CLOSE_DAY = day;
+  localStorage.setItem('fin_close_day', day);
+  syncToFirebase();
+  currentCycle = getCurrentCycle();
+  updateBadge();
+  loadNota();
+  render();
+  updateCyclePreview();
+  showToast(`✓ Ciclo atualizado: fecha todo dia ${day}.`);
+}
+
+function updateCyclePreview() {
+  const input = document.getElementById('closeDayInput');
+  if (!input) return;
+  const day = parseInt(input.value) || CLOSE_DAY;
+  if (day < 1 || day > 28) { document.getElementById('cyclePreview').textContent = 'Dia inválido.'; return; }
+  const startDay = day + 1;
+  const today = new Date();
+  const ex1 = `${String(startDay).padStart(2,'0')}/01 – ${String(day).padStart(2,'0')}/02`;
+  const ex2 = `${String(startDay).padStart(2,'0')}/02 – ${String(day).padStart(2,'0')}/03`;
+  const ex3 = `${String(startDay).padStart(2,'0')}/03 – ${String(day).padStart(2,'0')}/04`;
+  document.getElementById('cyclePreview').innerHTML =
+    `<span style="color:var(--accent)">Exemplo:</span> Fev: ${ex1} · Mar: ${ex2} · Abr: ${ex3}`;
+}
+
+function initCloseDayInput() {
+  const input = document.getElementById('closeDayInput');
+  if (!input) return;
+  input.value = CLOSE_DAY;
+  updateCyclePreview();
+  input.addEventListener('input', updateCyclePreview);
 }
 
 // init() is called by Firebase loader above
